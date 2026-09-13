@@ -29,12 +29,38 @@ type MappingDecision =
   | "source"
   | "reject";
 
+/**
+ * ============================================================
+ * Mapping Type
+ * ============================================================
+ *
+ * canonical:
+ *   Canonical Schemaのname / aliasによる固定Mapping
+ *
+ * ai:
+ *   AIによるMapping
+ */
+type MappingType =
+  | "canonical"
+  | "ai";
+
 type ConfirmedMapping = {
   sourceFile: string;
 
   sourceColumn: string;
 
   targetColumn: string;
+
+  /*
+   * Mappingがどの仕組みで確定したか。
+   *
+   * canonical:
+   *   Canonical Schemaによる固定Mapping
+   *
+   * ai:
+   *   AIによるMapping
+   */
+  mappingType: MappingType;
 
   /*
    * target:
@@ -73,6 +99,10 @@ type AnalyzeResponse = {
 
   suggestions: MappingSuggestion[];
 
+  /**
+   * Canonical Schemaによって
+   * 自動的に確定したMapping。
+   */
   automaticMappings:
   ConfirmedMapping[];
 
@@ -296,9 +326,24 @@ function App() {
 
       setResult(data);
 
+      /**
+       * automaticMappingsは
+       * Backend側でCanonical Schemaによって
+       * 自動確定されたMapping。
+       *
+       * BackendからmappingTypeが返ってこない
+       * 既存データにも対応できるよう、
+       * ここではcanonicalとして扱う。
+       */
       setConfirmedMappings(
-        data.automaticMappings ??
-        [],
+        (data.automaticMappings ?? []).map(
+          (mapping) => ({
+            ...mapping,
+            mappingType:
+              mapping.mappingType ??
+              "canonical",
+          }),
+        ),
       );
     } catch (err) {
       console.error(
@@ -436,6 +481,9 @@ function App() {
         suggestion:
           currentSuggestion,
 
+        mappingType:
+          "ai",
+
         decision,
 
         sourceColumn:
@@ -477,6 +525,13 @@ function App() {
 
             targetColumn:
               currentSuggestion.candidateColumn,
+
+            /**
+             * このMappingはAIによって
+             * 提案・確定されたもの。
+             */
+            mappingType:
+              "ai",
 
             decision,
 
@@ -589,6 +644,14 @@ function App() {
        * IMPORTANT:
        *
        * BackendはconfirmedMappingsを読む。
+       *
+       * mappingTypeもそのままBackendへ渡す。
+       *
+       * canonical:
+       *   Canonical Schemaによる固定Mapping
+       *
+       * ai:
+       *   AIによるMapping
        */
 
       formData.append(
@@ -1016,6 +1079,20 @@ function App() {
                 現在のマッピング
               </h3>
 
+              <p className={styles.help}>
+                <span>
+                  [Schema]
+                </span>
+                {" "}
+                Canonical Schemaのname / aliasによる固定Mapping
+                {" / "}
+                <span>
+                  [AI]
+                </span>
+                {" "}
+                AIによるMapping
+              </p>
+
               {confirmedMappings.length ===
                 0 ? (
                 <p className={styles.help}>
@@ -1036,11 +1113,34 @@ function App() {
 
                         <div>
 
-                          <strong>
-                            {
-                              mapping.sourceColumn
-                            }
-                          </strong>
+                          <div>
+                            <strong>
+                              {
+                                mapping.sourceColumn
+                              }
+                            </strong>
+
+                            <span
+                              style={{
+                                marginLeft:
+                                  "8px",
+                                fontSize:
+                                  "12px",
+                                fontWeight:
+                                  600,
+                                color:
+                                  mapping.mappingType ===
+                                    "canonical"
+                                    ? "#2563eb"
+                                    : "#7c3aed",
+                              }}
+                            >
+                              {mapping.mappingType ===
+                                "canonical"
+                                ? "[Schema]"
+                                : "[AI]"}
+                            </span>
+                          </div>
 
                           <small>
                             {
@@ -1227,11 +1327,11 @@ function App() {
                 <div>
 
                   <span className={styles.aiLabel}>
-                    AIによる統合候補
+                    AI Mapping
                   </span>
 
                   <h2>
-                    同じ意味の可能性がある列
+                    AIによる統合候補
                   </h2>
 
                 </div>
@@ -1279,7 +1379,7 @@ function App() {
                 >
 
                   <span>
-                    統合先
+                    Canonical候補
                   </span>
 
                   <strong>
@@ -1308,7 +1408,7 @@ function App() {
 
               <div className={styles.modalQuestion}>
 
-                この候補を統合します。
+                このAI候補を統合します。
                 どちらのデータを採用しますか？
 
               </div>
