@@ -1,49 +1,39 @@
 import express from "express";
 import multer from "multer";
 import cors from "cors";
-import ExcelJS from "exceljs";
 import crypto from "crypto";
 import path from "path";
-import { parse } from "csv-parse/sync";
 
-import { AIProvider } from "./ai/aiProvider";
-import { createAIProvider } from "./ai/createaiProvider";
+import {
+    AIProvider,
+} from "./ai/aiProvider";
+
+import {
+    createAIProvider,
+} from "./ai/createaiProvider";
+
+import {
+    parseInputFile,
+} from "./engine/parser";
+
+import {
+    mergeFiles,
+    MergeMapping,
+} from "./engine/merger";
+
+import {
+    exportToXlsx,
+} from "./engine/exporter";
+
+import {
+    ColumnInfo,
+    ParsedFile,
+    MappingDecision,
+} from "./canonical/types";
 
 // ============================================================
 // Types
 // ============================================================
-
-type CellValue =
-    | string
-    | number
-    | boolean
-    | Date
-    | null
-    | undefined;
-
-type ColumnInfo = {
-    name: string;
-    type: string;
-    samples: string[];
-};
-
-type FileInfo = {
-    id: string;
-    filename: string;
-
-    type:
-    | "csv"
-    | "xlsx";
-
-    sheetName: string;
-
-    columns: ColumnInfo[];
-
-    rows: Record<
-        string,
-        CellValue
-    >[];
-};
 
 type MappingSuggestion = {
     id: string;
@@ -58,11 +48,6 @@ type MappingSuggestion = {
 
     reason: string;
 };
-
-type MappingDecision =
-    | "target"
-    | "source"
-    | "reject";
 
 type ConfirmedMapping = {
     sourceFile: string;
@@ -178,102 +163,6 @@ try {
 // Utility
 // ============================================================
 
-function normalizeColumnName(
-    value: string,
-): string {
-    return value
-        .trim()
-        .replace(/\s+/g, " ");
-}
-
-function cellToString(
-    value: unknown,
-): string {
-    if (
-        value === null ||
-        value === undefined
-    ) {
-        return "";
-    }
-
-    if (
-        value instanceof Date
-    ) {
-        return value.toISOString();
-    }
-
-    if (
-        typeof value === "object"
-    ) {
-        try {
-            return JSON.stringify(
-                value,
-            );
-        } catch {
-            return String(value);
-        }
-    }
-
-    return String(value);
-}
-
-function isEmptyCell(
-    value: unknown,
-): boolean {
-    return (
-        value === null ||
-        value === undefined ||
-        cellToString(value).trim() === ""
-    );
-}
-
-function inferType(
-    values: CellValue[],
-): string {
-    const nonEmpty =
-        values.filter(
-            (value) =>
-                !isEmptyCell(value),
-        );
-
-    if (
-        nonEmpty.length === 0
-    ) {
-        return "unknown";
-    }
-
-    if (
-        nonEmpty.every(
-            (value) =>
-                value instanceof Date,
-        )
-    ) {
-        return "date";
-    }
-
-    if (
-        nonEmpty.every(
-            (value) =>
-                typeof value ===
-                "number",
-        )
-    ) {
-        return "number";
-    }
-
-    if (
-        nonEmpty.every(
-            (value) =>
-                typeof value ===
-                "boolean",
-        )
-    ) {
-        return "boolean";
-    }
-
-    return "string";
-}
-
 function normalizeForComparison(
     value: string,
 ): string {
@@ -284,601 +173,6 @@ function normalizeForComparison(
             /[\s_\-./]/g,
             "",
         );
-}
-
-function cloneValue(
-    value: CellValue,
-): CellValue {
-    if (
-        value instanceof Date
-    ) {
-        return new Date(
-            value.getTime(),
-        );
-    }
-
-    return value;
-}
-
-function getUniqueColumnName(
-    existing: Set<string>,
-    desired: string,
-): string {
-    const base =
-        desired.trim() ||
-        "Column";
-
-    if (
-        !existing.has(base)
-    ) {
-        return base;
-    }
-
-    let index = 2;
-
-    while (
-        existing.has(
-            `${base}_${index}`,
-        )
-    ) {
-        index++;
-    }
-
-    return `${base}_${index}`;
-}
-
-// ============================================================
-// Safe row value getter
-// ============================================================
-
-function getValueByColumn(
-    row: Record<
-        string,
-        CellValue
-    >,
-    columnName: string,
-): CellValue {
-    return row[columnName];
-}
-
-// ============================================================
-// CSV
-// ============================================================
-
-function decodeCsv(
-    buffer: Buffer,
-): string {
-    if (
-        buffer.length >= 3 &&
-        buffer[0] === 0xef &&
-        buffer[1] === 0xbb &&
-        buffer[2] === 0xbf
-    ) {
-        return buffer
-            .subarray(3)
-            .toString("utf8");
-    }
-
-    const utf8 =
-        buffer.toString("utf8");
-
-    const replacementCount =
-        (
-            utf8.match(/\ufffd/g) ||
-            []
-        ).length;
-
-    if (
-        replacementCount > 0
-    ) {
-        try {
-            const iconv =
-                require(
-                    "iconv-lite",
-                );
-
-            if (
-                iconv.encodingExists(
-                    "cp932",
-                )
-            ) {
-                return iconv.decode(
-                    buffer,
-                    "cp932",
-                );
-            }
-        } catch {
-            // UTF-8 fallback
-        }
-    }
-
-    return utf8;
-}
-
-function parseCsv(
-    buffer: Buffer,
-    filename: string,
-): FileInfo {
-    const text =
-        decodeCsv(buffer);
-
-    let records:
-        Record<
-            string,
-            string
-        >[];
-
-    try {
-        records =
-            parse(text, {
-                columns: true,
-
-                skip_empty_lines: true,
-
-                bom: true,
-
-                relax_column_count: true,
-
-                trim: true,
-            }) as Record<
-                string,
-                string
-            >[];
-    } catch (error) {
-        console.error(
-            "[CSV] parse error:",
-            error,
-        );
-
-        throw new Error(
-            `${filename}: CSVの解析に失敗しました。`,
-        );
-    }
-
-    if (
-        records.length === 0
-    ) {
-        throw new Error(
-            `${filename}: CSVにデータがありません。`,
-        );
-    }
-
-    const originalHeaders =
-        Object.keys(
-            records[0],
-        );
-
-    const headers =
-        originalHeaders.map(
-            normalizeColumnName,
-        );
-
-    const rows:
-        Record<
-            string,
-            CellValue
-        >[] =
-        records.map(
-            (record) => {
-                const result:
-                    Record<
-                        string,
-                        CellValue
-                    > = {};
-
-                originalHeaders.forEach(
-                    (
-                        originalHeader,
-                        index,
-                    ) => {
-                        result[
-                            headers[index]
-                        ] =
-                            record[
-                            originalHeader
-                            ] ?? "";
-                    },
-                );
-
-                return result;
-            },
-        );
-
-    const columns:
-        ColumnInfo[] =
-        headers.map(
-            (header) => {
-                const values =
-                    rows.map(
-                        (row) =>
-                            row[header],
-                    );
-
-                return {
-                    name: header,
-
-                    type:
-                        inferType(
-                            values,
-                        ),
-
-                    samples:
-                        values
-                            .filter(
-                                (
-                                    value,
-                                ) =>
-                                    !isEmptyCell(
-                                        value,
-                                    ),
-                            )
-                            .slice(0, 10)
-                            .map(
-                                cellToString,
-                            ),
-                };
-            },
-        );
-
-    console.log(
-        `[CSV] Parsed: ${filename}`,
-    );
-
-    console.log(
-        "[CSV] Columns:",
-        columns,
-    );
-
-    return {
-        id:
-            crypto.randomUUID(),
-
-        filename,
-
-        type: "csv",
-
-        sheetName: "CSV",
-
-        columns,
-
-        rows,
-    };
-}
-
-// ============================================================
-// XLSX
-// ============================================================
-
-async function parseXlsx(
-    buffer: Buffer,
-    filename: string,
-): Promise<FileInfo> {
-    const workbook =
-        new ExcelJS.Workbook();
-
-    await workbook.xlsx.load(
-        buffer as any,
-    );
-
-    const worksheet =
-        workbook.worksheets[0];
-
-    if (!worksheet) {
-        throw new Error(
-            `${filename}: ワークシートがありません。`,
-        );
-    }
-
-    // ========================================================
-    // Header row detection
-    // ========================================================
-
-    let headerRowNumber =
-        0;
-
-    for (
-        let rowNumber = 1;
-        rowNumber <=
-        worksheet.rowCount;
-        rowNumber++
-    ) {
-        const row =
-            worksheet.getRow(
-                rowNumber,
-            );
-
-        let nonEmptyCount =
-            0;
-
-        for (
-            let columnNumber = 1;
-            columnNumber <=
-            worksheet.columnCount;
-            columnNumber++
-        ) {
-            const value =
-                row
-                    .getCell(
-                        columnNumber,
-                    )
-                    .value;
-
-            if (
-                !isEmptyCell(value)
-            ) {
-                nonEmptyCount++;
-            }
-        }
-
-        if (
-            nonEmptyCount >= 2
-        ) {
-            headerRowNumber =
-                rowNumber;
-
-            break;
-        }
-    }
-
-    if (
-        headerRowNumber === 0
-    ) {
-        throw new Error(
-            `${filename}: Excelのヘッダー行を検出できませんでした。`,
-        );
-    }
-
-    console.log(
-        `[XLSX] Header row: ${headerRowNumber}`,
-    );
-
-    // ========================================================
-    // Header cells
-    // ========================================================
-
-    const headerRow =
-        worksheet.getRow(
-            headerRowNumber,
-        );
-
-    const headers:
-        string[] = [];
-
-    const columnCount =
-        Math.max(
-            worksheet.actualColumnCount,
-            worksheet.columnCount,
-        );
-
-    for (
-        let columnNumber = 1;
-        columnNumber <=
-        columnCount;
-        columnNumber++
-    ) {
-        const cell =
-            headerRow.getCell(
-                columnNumber,
-            );
-
-        const rawValue =
-            cell.value;
-
-        let header =
-            cellToString(
-                rawValue,
-            ).trim();
-
-        if (!header) {
-            header =
-                `Column${columnNumber}`;
-        }
-
-        header =
-            normalizeColumnName(
-                header,
-            );
-
-        headers.push(
-            header,
-        );
-    }
-
-    // ========================================================
-    // Data rows
-    // ========================================================
-
-    const rows:
-        Record<
-            string,
-            CellValue
-        >[] = [];
-
-    for (
-        let rowNumber =
-            headerRowNumber + 1;
-        rowNumber <=
-        worksheet.rowCount;
-        rowNumber++
-    ) {
-        const row =
-            worksheet.getRow(
-                rowNumber,
-            );
-
-        const result:
-            Record<
-                string,
-                CellValue
-            > = {};
-
-        let hasValue =
-            false;
-
-        for (
-            let columnNumber = 1;
-            columnNumber <=
-            headers.length;
-            columnNumber++
-        ) {
-            const header =
-                headers[
-                columnNumber - 1
-                ];
-
-            const value =
-                row
-                    .getCell(
-                        columnNumber,
-                    )
-                    .value as CellValue;
-
-            if (
-                !isEmptyCell(value)
-            ) {
-                hasValue =
-                    true;
-            }
-
-            result[header] =
-                value ?? "";
-        }
-
-        if (hasValue) {
-            rows.push(
-                result,
-            );
-        }
-    }
-
-    // ========================================================
-    // Column information
-    // ========================================================
-
-    const columns:
-        ColumnInfo[] =
-        headers.map(
-            (header) => {
-                const values =
-                    rows.map(
-                        (row) =>
-                            row[header],
-                    );
-
-                return {
-                    name: header,
-
-                    type:
-                        inferType(
-                            values,
-                        ),
-
-                    samples:
-                        values
-                            .filter(
-                                (
-                                    value,
-                                ) =>
-                                    !isEmptyCell(
-                                        value,
-                                    ),
-                            )
-                            .slice(0, 10)
-                            .map(
-                                cellToString,
-                            ),
-                };
-            },
-        );
-
-    console.log(
-        `[XLSX] Parsed: ${filename}`,
-    );
-
-    console.log(
-        `[XLSX] Sheet: ${worksheet.name}`,
-    );
-
-    console.log(
-        `[XLSX] Data rows: ${rows.length}`,
-    );
-
-    console.log(
-        "[XLSX] Columns:",
-        columns,
-    );
-
-    return {
-        id:
-            crypto.randomUUID(),
-
-        filename,
-
-        type: "xlsx",
-
-        sheetName:
-            worksheet.name,
-
-        columns,
-
-        rows,
-    };
-}
-
-// ============================================================
-// File parser
-// ============================================================
-
-function isExcel(
-    filename: string,
-): boolean {
-    return (
-        path
-            .extname(filename)
-            .toLowerCase() ===
-        ".xlsx"
-    );
-}
-
-function isCsv(
-    filename: string,
-): boolean {
-    return (
-        path
-            .extname(filename)
-            .toLowerCase() ===
-        ".csv"
-    );
-}
-
-async function parseInputFile(
-    file: Express.Multer.File,
-): Promise<FileInfo> {
-    if (
-        isExcel(
-            file.originalname,
-        )
-    ) {
-        return parseXlsx(
-            file.buffer,
-            file.originalname,
-        );
-    }
-
-    if (
-        isCsv(
-            file.originalname,
-        )
-    ) {
-        return parseCsv(
-            file.buffer,
-            file.originalname,
-        );
-    }
-
-    throw new Error(
-        `${file.originalname}: .xlsx または .csv のみ対応しています。`,
-    );
 }
 
 // ============================================================
@@ -1013,8 +307,7 @@ function parseSuggestionResponse(
                     confidence,
                 )
             ) {
-                confidence =
-                    0.8;
+                confidence = 0.8;
             }
 
             confidence =
@@ -1065,7 +358,7 @@ function parseSuggestionResponse(
 // ============================================================
 
 async function createMappingSuggestions(
-    sourceFiles: FileInfo[],
+    sourceFiles: ParsedFile[],
     targetColumns: ColumnInfo[],
     organizationKey: string,
     ai: AIProvider,
@@ -1105,13 +398,13 @@ async function createMappingSuggestions(
             file.columns
         ) {
             const sourceName =
-                normalizeColumnName(
-                    column.name,
-                );
+                column.name.trim();
 
-            // ----------------------------------------------------
-            // 完全一致
-            // ----------------------------------------------------
+            /**
+             * ==================================================
+             * 完全一致
+             * ==================================================
+             */
 
             let target =
                 targetNames.find(
@@ -1141,9 +434,11 @@ async function createMappingSuggestions(
                 continue;
             }
 
-            // ----------------------------------------------------
-            // 正規化一致
-            // ----------------------------------------------------
+            /**
+             * ==================================================
+             * 正規化一致
+             * ==================================================
+             */
 
             const normalizedSource =
                 normalizeForComparison(
@@ -1180,9 +475,11 @@ async function createMappingSuggestions(
                 continue;
             }
 
-            // ----------------------------------------------------
-            // AI候補
-            // ----------------------------------------------------
+            /**
+             * ==================================================
+             * AI候補
+             * ==================================================
+             */
 
             aiCandidates.push({
                 sourceFile:
@@ -1193,6 +490,9 @@ async function createMappingSuggestions(
         }
     }
 
+    /**
+     * AIに渡す候補がない場合。
+     */
     if (
         aiCandidates.length ===
         0
@@ -1290,7 +590,7 @@ decision = "source" なら出力列名を「sale」
   "suggestions": [
     {
       "sourceFile": "testdata2.xlsx",
-            "sourceColumn": "sale",
+      "sourceColumn": "sale",
       "candidateColumn": "売上高",
       "confidence": 0.96,
       "reason": "saleと売上高は売上金額を表すため同じ意味です。"
@@ -1325,21 +625,25 @@ decision = "source" なら出力列名を「sale」
         const suggestion of
         parsed
     ) {
+        /**
+         * Source存在確認
+         */
         const sourceExists =
             aiCandidates.some(
                 (source) =>
                     source.sourceFile ===
-                        suggestion.sourceFile &&
+                    suggestion.sourceFile &&
                     source.column.name ===
-                        suggestion.sourceColumn,
+                    suggestion.sourceColumn,
             );
 
-        if (
-            !sourceExists
-        ) {
+        if (!sourceExists) {
             continue;
         }
 
+        /**
+         * Target存在確認
+         */
         const targetExists =
             targetColumns.some(
                 (
@@ -1349,12 +653,13 @@ decision = "source" なら出力列名を「sale」
                     suggestion.candidateColumn,
             );
 
-        if (
-            !targetExists
-        ) {
+        if (!targetExists) {
             continue;
         }
 
+        /**
+         * confidence確認
+         */
         if (
             suggestion.confidence <
             0.7
@@ -1370,6 +675,9 @@ decision = "source" なら出力列名を「sale」
         });
     }
 
+    /**
+     * confidence降順
+     */
     suggestions.sort(
         (a, b) =>
             b.confidence -
@@ -1389,12 +697,12 @@ decision = "source" なら出力列名を「sale」
 
 function parseConfirmedMappings(
     value: unknown,
-): ConfirmedMapping[] {
+): MergeMapping[] {
     if (
         typeof value !==
-            "string" ||
+        "string" ||
         value.trim() ===
-            ""
+        ""
     ) {
         return [];
     }
@@ -1413,7 +721,7 @@ function parseConfirmedMappings(
         }
 
         const result:
-            ConfirmedMapping[] =
+            MergeMapping[] =
             [];
 
         for (
@@ -1423,7 +731,7 @@ function parseConfirmedMappings(
             if (
                 !item ||
                 typeof item !==
-                    "object"
+                "object"
             ) {
                 continue;
             }
@@ -1436,40 +744,53 @@ function parseConfirmedMappings(
 
             if (
                 typeof raw.sourceFile !==
-                    "string" ||
+                "string" ||
                 typeof raw.sourceColumn !==
-                    "string" ||
-                typeof raw.targetColumn !==
-                    "string"
+                "string"
             ) {
+                continue;
+            }
+
+            /**
+             * targetColumnを優先。
+             *
+             * canonicalColumnを送るクライアントにも
+             * 対応する。
+             */
+            const targetColumn =
+                typeof raw.targetColumn ===
+                    "string"
+                    ? raw.targetColumn
+                    : typeof raw.canonicalColumn ===
+                        "string"
+                        ? raw.canonicalColumn
+                        : "";
+
+            if (!targetColumn) {
                 continue;
             }
 
             const decision =
                 raw.decision ===
                     "source" ||
-                raw.decision ===
+                    raw.decision ===
                     "reject"
                     ? raw.decision
                     : "target";
 
-            /*
-             * outputColumnはクライアントから来ても
+            /**
+             * outputColumnはclientから来た値を
              * そのまま信用しない。
-             *
-             * target:
-             *   targetColumn
-             *
-             * source:
-             *   sourceColumn
-             *
-             * としてサーバー側で決定する。
              */
             const outputColumn =
                 decision === "source"
                     ? raw.sourceColumn
-                    : raw.targetColumn;
+                    : targetColumn;
 
+            /**
+             * marger.tsはcanonicalColumnを
+             * 基本フィールドとして使用する。
+             */
             result.push({
                 sourceFile:
                     raw.sourceFile,
@@ -1477,8 +798,8 @@ function parseConfirmedMappings(
                 sourceColumn:
                     raw.sourceColumn,
 
-                targetColumn:
-                    raw.targetColumn,
+                canonicalColumn:
+                    targetColumn,
 
                 decision,
 
@@ -1508,8 +829,8 @@ app.post(
         try {
             const files =
                 req.files as
-                    | Express.Multer.File[]
-                    | undefined;
+                | Express.Multer.File[]
+                | undefined;
 
             if (
                 !files ||
@@ -1530,6 +851,12 @@ app.post(
                     ? req.body.organizationKey
                     : "";
 
+            /**
+             * ==================================================
+             * Parse
+             * ==================================================
+             */
+
             const parsedFiles =
                 await Promise.all(
                     files.map(
@@ -1540,35 +867,40 @@ app.post(
                     ),
                 );
 
-            /*
-             * 先頭ファイルを統合先にする
+            /**
+             * ==================================================
+             * Target
+             * ==================================================
+             *
+             * 先頭ファイルを統合先とする。
              */
-            const targetFilename =
-                files[0]
-                    .originalname;
 
             const targetFile =
-                parsedFiles.find(
-                    (file) =>
-                        file.filename ===
-                        targetFilename,
-                );
+                parsedFiles[0];
 
             if (!targetFile) {
                 return res
                     .status(400)
                     .json({
                         error:
-                            `統合先ファイルが見つかりません: ${targetFilename}`,
+                            "統合先ファイルが見つかりません。",
                     });
             }
 
+            /**
+             * ==================================================
+             * Sources
+             * ==================================================
+             */
+
             const sourceFiles =
-                parsedFiles.filter(
-                    (file) =>
-                        file.id !==
-                        targetFile.id,
-                );
+                parsedFiles.slice(1);
+
+            /**
+             * ==================================================
+             * AI Mapping
+             * ==================================================
+             */
 
             const mapping =
                 await createMappingSuggestions(
@@ -1580,6 +912,12 @@ app.post(
 
                     aiProvider,
                 );
+
+            /**
+             * ==================================================
+             * Unmatched source columns
+             * ==================================================
+             */
 
             const mappedSourceColumns =
                 new Set<string>();
@@ -1622,6 +960,12 @@ app.post(
                             ),
                 );
 
+            /**
+             * ==================================================
+             * Unmatched target columns
+             * ==================================================
+             */
+
             const mappedTargetColumns =
                 new Set<string>();
 
@@ -1659,6 +1003,12 @@ app.post(
                         ) =>
                             column.name,
                     );
+
+            /**
+             * ==================================================
+             * Response
+             * ==================================================
+             */
 
             const response:
                 AnalyzeResponse = {
@@ -1741,8 +1091,8 @@ app.post(
 
             const files =
                 req.files as
-                    | Express.Multer.File[]
-                    | undefined;
+                | Express.Multer.File[]
+                | undefined;
 
             if (
                 !files ||
@@ -1763,9 +1113,11 @@ app.post(
                     ? req.body.organizationKey
                     : "";
 
-            // ====================================================
-            // Parse
-            // ====================================================
+            /**
+             * ==================================================
+             * Parse
+             * ==================================================
+             */
 
             const parsedFiles =
                 await Promise.all(
@@ -1777,40 +1129,34 @@ app.post(
                     ),
                 );
 
-            // ====================================================
-            // Target
-            // ====================================================
-
-            const targetFilename =
-                files[0]
-                    .originalname;
+            /**
+             * ==================================================
+             * Target
+             * ==================================================
+             *
+             * 先頭ファイルを統合先にする。
+             */
 
             const targetFile =
-                parsedFiles.find(
-                    (file) =>
-                        file.filename ===
-                        targetFilename,
-                );
+                parsedFiles[0];
 
             if (!targetFile) {
                 return res
                     .status(400)
                     .json({
                         error:
-                            `統合先ファイルが見つかりません: ${targetFilename}`,
+                            "統合先ファイルが見つかりません。",
                     });
             }
 
-            // ====================================================
-            // Source
-            // ====================================================
+            /**
+             * ==================================================
+             * Sources
+             * ==================================================
+             */
 
             const sourceFiles =
-                parsedFiles.filter(
-                    (file) =>
-                        file.id !==
-                        targetFile.id,
-                );
+                parsedFiles.slice(1);
 
             console.log(
                 "[TRANSFORM] Target:",
@@ -1825,9 +1171,11 @@ app.post(
                 ),
             );
 
-            // ====================================================
-            // Confirmed mappings
-            // ====================================================
+            /**
+             * ==================================================
+             * Confirmed mappings
+             * ==================================================
+             */
 
             const confirmedMappings =
                 parseConfirmedMappings(
@@ -1844,14 +1192,20 @@ app.post(
                 ),
             );
 
-            // ====================================================
-            // Mapping
-            // ====================================================
+            /**
+             * ==================================================
+             * Mapping
+             * ==================================================
+             */
 
             let mappings:
-                ConfirmedMapping[] =
+                MergeMapping[] =
                 confirmedMappings;
 
+            /**
+             * confirmedMappingsがない場合は
+             * 自動Mappingを使う。
+             */
             if (
                 mappings.length === 0
             ) {
@@ -1868,7 +1222,25 @@ app.post(
 
                 mappings =
                     automaticResult
-                        .automaticMappings;
+                        .automaticMappings
+                        .map(
+                            (mapping) => ({
+                                sourceFile:
+                                    mapping.sourceFile,
+
+                                sourceColumn:
+                                    mapping.sourceColumn,
+
+                                canonicalColumn:
+                                    mapping.targetColumn,
+
+                                decision:
+                                    mapping.decision,
+
+                                outputColumn:
+                                    mapping.outputColumn,
+                            }),
+                        );
 
                 console.log(
                     "[MAPPING] No confirmed mappings supplied.",
@@ -1884,604 +1256,59 @@ app.post(
                 );
             }
 
-            // ====================================================
-            // Validate mappings
-            // ====================================================
+            /**
+             * ==================================================
+             * Merge
+             * ==================================================
+             */
 
-            const validMappings:
-                ConfirmedMapping[] =
-                [];
+            const merged =
+                mergeFiles(
+                    targetFile,
 
-            for (
-                const mapping of
-                mappings
-            ) {
-                const sourceFile =
-                    sourceFiles.find(
-                        (file) =>
-                            file.filename ===
-                            mapping.sourceFile,
-                    );
+                    sourceFiles,
 
-                if (!sourceFile) {
-                    console.warn(
-                        "[MAPPING] Source file not found:",
-                        mapping,
-                    );
-
-                    continue;
-                }
-
-                const sourceColumnExists =
-                    sourceFile.columns.some(
-                        (column) =>
-                            column.name ===
-                            mapping.sourceColumn,
-                    );
-
-                if (
-                    !sourceColumnExists
-                ) {
-                    console.warn(
-                        "[MAPPING] Source column not found:",
-                        mapping,
-                    );
-
-                    continue;
-                }
-
-                const targetColumnExists =
-                    targetFile.columns.some(
-                        (column) =>
-                            column.name ===
-                            mapping.targetColumn,
-                    );
-
-                if (
-                    !targetColumnExists
-                ) {
-                    console.warn(
-                        "[MAPPING] Target column not found:",
-                        mapping,
-                    );
-
-                    continue;
-                }
-
-                if (
-                    mapping.decision ===
-                    "reject"
-                ) {
-                    console.log(
-                        "[MAPPING] Rejected:",
-                        mapping,
-                    );
-
-                    continue;
-                }
-
-                /*
-                 * ここが重要。
-                 *
-                 * outputColumnはclientから渡された値ではなく、
-                 * decisionから必ず再計算する。
-                 *
-                 * target:
-                 *   売上高
-                 *
-                 * source:
-                 *   sale
-                 */
-                mapping.outputColumn =
-                    mapping.decision ===
-                    "source"
-                        ? mapping.sourceColumn
-                        : mapping.targetColumn;
-
-                validMappings.push(
-                    mapping,
+                    mappings,
                 );
-            }
 
             console.log(
-                "[MAPPING] Valid mappings:",
+                "[MERGE] Rows:",
+                merged.rows.length,
+            );
+
+            console.log(
+                "[MERGE] Definitions:",
                 JSON.stringify(
-                    validMappings,
+                    merged.definitions,
                     null,
                     2,
                 ),
             );
 
-            // ====================================================
-            // Column merge definition
-            // ====================================================
-            //
-            // targetの列を基本とする。
-            //
-            // source列がtarget列にマッピングされた場合、
-            // 新しいdefinitionは作らない。
-            //
-            // 例:
-            //
-            // targetColumn = 売上高
-            // sourceColumn = sale
-            //
-            // decision = target
-            //   outputColumn = 売上高
-            //
-            // decision = source
-            //   outputColumn = sale
-            //
-            // どちらも同じ「1つのdefinition」。
-            // ====================================================
-
-            type ColumnMergeDefinition = {
-                targetColumn: string;
-
-                outputColumn: string;
-
-                sourceColumns: {
-                    sourceFile: string;
-
-                    sourceColumn: string;
-                }[];
-            };
-
-            // ====================================================
-            // 1. Target columns
-            // ====================================================
-
-            const definitions:
-                ColumnMergeDefinition[] =
-                [];
-
-            const targetDefinitionMap =
-                new Map<
-                    string,
-                    ColumnMergeDefinition
-                >();
-
-            for (
-                const targetColumn of
-                targetFile.columns
-            ) {
-                const definition:
-                    ColumnMergeDefinition =
-                {
-                    targetColumn:
-                        targetColumn.name,
-
-                    outputColumn:
-                        targetColumn.name,
-
-                    sourceColumns: [],
-                };
-
-                definitions.push(
-                    definition,
-                );
-
-                targetDefinitionMap.set(
-                    targetColumn.name,
-                    definition,
-                );
-            }
-
-            // ====================================================
-            // 2. Apply mappings
-            //
-            // 新しい列は作らない。
-            //
-            // 既存target definitionの
-            // outputColumnだけを変更する。
-            // ====================================================
-
-            for (
-                const mapping of
-                validMappings
-            ) {
-                const definition =
-                    targetDefinitionMap.get(
-                        mapping.targetColumn,
-                    );
-
-                if (!definition) {
-                    continue;
-                }
-
-                /*
-                 * targetを選択した場合:
-                 *
-                 *   売上高
-                 *
-                 * sourceを選択した場合:
-                 *
-                 *   sale
-                 */
-                definition.outputColumn =
-                    mapping.decision ===
-                    "source"
-                        ? mapping.sourceColumn
-                        : mapping.targetColumn;
-
-                const exists =
-                    definition.sourceColumns.some(
-                        (
-                            source,
-                        ) =>
-                            source.sourceFile ===
-                                mapping.sourceFile &&
-                            source.sourceColumn ===
-                                mapping.sourceColumn,
-                    );
-
-                if (!exists) {
-                    definition.sourceColumns.push({
-                        sourceFile:
-                            mapping.sourceFile,
-
-                        sourceColumn:
-                            mapping.sourceColumn,
-                    });
-                }
-            }
-
-            // ====================================================
-            // 3. Output column names must be unique
-            //
-            // 原則として新しい列を作らない。
-            //
-            // 同一target列に複数sourceが紐付いた場合でも、
-            // 同じdefinitionを使う。
-            // ====================================================
-
-            const usedOutputColumns =
-                new Set<string>();
-
-            for (
-                const definition of
-                definitions
-            ) {
-                const desired =
-                    definition.outputColumn;
-
-                const uniqueName =
-                    getUniqueColumnName(
-                        usedOutputColumns,
-
-                        desired,
-                    );
-
-                definition.outputColumn =
-                    uniqueName;
-
-                usedOutputColumns.add(
-                    uniqueName,
-                );
-            }
-
-            console.log(
-                "[TRANSFORM] Column definitions:",
-                JSON.stringify(
-                    definitions,
-                    null,
-                    2,
-                ),
-            );
-
-            // ====================================================
-            // 4. Build target output rows
-            //
-            // targetファイルの行はそのまま保持。
-            // ====================================================
-
-            const outputRows:
-                Record<
-                    string,
-                    CellValue
-                >[] =
-                targetFile.rows.map(
-                    (targetRow) => {
-                        const result:
-                            Record<
-                                string,
-                                CellValue
-                            > = {};
-
-                        for (
-                            const definition of
-                            definitions
-                        ) {
-                            if (
-                                definition.targetColumn
-                            ) {
-                                result[
-                                    definition.outputColumn
-                                ] =
-                                    cloneValue(
-                                        getValueByColumn(
-                                            targetRow,
-                                            definition.targetColumn,
-                                        ),
-                                    );
-                            } else {
-                                result[
-                                    definition.outputColumn
-                                ] = "";
-                            }
-                        }
-
-                        return result;
-                    },
-                );
-
-            // ====================================================
-            // 5. Append source rows
-            //
-            // sourceの行を下方向へ追加する。
-            //
-            // ただし、source列は必ず既存の
-            // target definitionへ入れる。
-            //
-            // そのため sale という新規列は作られない。
-            // ====================================================
-
-            for (
-                const sourceFile of
-                sourceFiles
-            ) {
-                const sourceMappings =
-                    validMappings.filter(
-                        (mapping) =>
-                            mapping.sourceFile ===
-                                sourceFile.filename &&
-                            mapping.decision !==
-                                "reject",
-                    );
-
-                if (
-                    sourceMappings.length ===
-                    0
-                ) {
-                    continue;
-                }
-
-                for (
-                    const sourceRow of
-                    sourceFile.rows
-                ) {
-                    const result:
-                        Record<
-                            string,
-                            CellValue
-                        > = {};
-
-                    // --------------------------------------------
-                    // 全列を空で初期化
-                    // --------------------------------------------
-
-                    for (
-                        const definition of
-                        definitions
-                    ) {
-                        result[
-                            definition.outputColumn
-                        ] = "";
-                    }
-
-                    // --------------------------------------------
-                    // source値を対応する列へ入れる
-                    // --------------------------------------------
-
-                    for (
-                        const mapping of
-                        sourceMappings
-                    ) {
-                        const definition =
-                            definitions.find(
-                                (
-                                    item,
-                                ) =>
-                                    item.targetColumn ===
-                                        mapping.targetColumn &&
-                                    item.sourceColumns.some(
-                                        (
-                                            source,
-                                        ) =>
-                                            source.sourceFile ===
-                                                mapping.sourceFile &&
-                                            source.sourceColumn ===
-                                                mapping.sourceColumn,
-                                    ),
-                            );
-
-                        if (
-                            !definition
-                        ) {
-                            console.warn(
-                                "[TRANSFORM] Definition not found:",
-                                mapping,
-                            );
-
-                            continue;
-                        }
-
-                        const value =
-                            getValueByColumn(
-                                sourceRow,
-                                mapping.sourceColumn,
-                            );
-
-                        /*
-                         * target/sourceの選択に応じて
-                         * 決定されたoutputColumnへ入れる。
-                         */
-                        result[
-                            definition.outputColumn
-                        ] =
-                            cloneValue(
-                                value,
-                            );
-                    }
-
-                    outputRows.push(
-                        result,
-                    );
-                }
-            }
-
-            // ====================================================
-            // 6. Create workbook
-            // ====================================================
-
-            const workbook =
-                new ExcelJS.Workbook();
-
-            const worksheet =
-                workbook.addWorksheet(
-                    targetFile.sheetName ||
-                        "Merged",
-                );
-
-            // ====================================================
-            // Headers
-            // ====================================================
-
-            const outputColumns =
-                definitions.map(
-                    (
-                        definition,
-                    ) =>
-                        definition.outputColumn,
-                );
-
-            worksheet.addRow(
-                outputColumns,
-            );
-
-            // ====================================================
-            // Data
-            // ====================================================
-
-            for (
-                const row of
-                outputRows
-            ) {
-                worksheet.addRow(
-                    outputColumns.map(
-                        (
-                            column,
-                        ) =>
-                            row[column] ??
-                            "",
-                    ),
-                );
-            }
-
-            // ====================================================
-            // Basic formatting
-            // ====================================================
-
-            const headerRow =
-                worksheet.getRow(1);
-
-            headerRow.font = {
-                bold: true,
-            };
-
-            headerRow.alignment = {
-                vertical:
-                    "middle",
-
-                horizontal:
-                    "center",
-            };
-
-            headerRow.fill = {
-                type: "pattern",
-
-                pattern:
-                    "solid",
-
-                fgColor: {
-                    argb: "D9EAF7",
-                },
-            };
-
-            worksheet.views = [
-                {
-                    state: "frozen",
-
-                    ySplit: 1,
-                },
-            ];
-
-            worksheet.columns =
-                outputColumns.map(
-                    (
-                        column,
-                        index,
-                    ) => {
-                        let maxLength =
-                            column.length;
-
-                        for (
-                            let rowIndex = 2;
-                            rowIndex <=
-                            Math.min(
-                                worksheet.rowCount,
-                                101,
-                            );
-                            rowIndex++
-                        ) {
-                            const value =
-                                worksheet
-                                    .getRow(
-                                        rowIndex,
-                                    )
-                                    .getCell(
-                                        index + 1,
-                                    )
-                                    .value;
-
-                            const length =
-                                cellToString(
-                                    value,
-                                ).length;
-
-                            maxLength =
-                                Math.max(
-                                    maxLength,
-                                    length,
-                                );
-                        }
-
-                        return {
-                            header:
-                                column,
-
-                            key:
-                                column,
-
-                            width:
-                                Math.min(
-                                    Math.max(
-                                        maxLength +
-                                            2,
-                                        10,
-                                    ),
-                                    50,
-                                ),
-                        };
-                    },
-                );
-
-            // ====================================================
-            // Response
-            // ====================================================
+            /**
+             * ==================================================
+             * Export
+             * ==================================================
+             */
 
             const outputBuffer =
-                await workbook.xlsx.writeBuffer();
+                await exportToXlsx(
+                    merged.rows,
+
+                    merged.definitions,
+
+                    {
+                        sheetName:
+                            targetFile.sheetName ||
+                            "Merged",
+                    },
+                );
+
+            /**
+             * ==================================================
+             * Output filename
+             * ==================================================
+             */
 
             const outputFilename =
                 `${path.basename(
@@ -2498,12 +1325,18 @@ app.post(
 
             console.log(
                 "[TRANSFORM] Output rows:",
-                outputRows.length,
+                merged.rows.length,
             );
 
             console.log(
                 "[API] /api/transform END",
             );
+
+            /**
+             * ==================================================
+             * Response
+             * ==================================================
+             */
 
             res.setHeader(
                 "Content-Type",
@@ -2518,9 +1351,7 @@ app.post(
             );
 
             return res.send(
-                Buffer.from(
-                    outputBuffer,
-                ),
+                outputBuffer,
             );
         } catch (error) {
             console.error(
@@ -2560,7 +1391,7 @@ app.get(
 const PORT =
     Number(
         process.env.PORT ||
-            3001,
+        3001,
     );
 
 app.listen(
